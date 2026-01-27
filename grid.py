@@ -209,7 +209,7 @@ def calculate_instant_coverage_map(
     dt: datetime,
     resolution_deg: float = 2.0,
     min_elevation: float = 10.0
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculate a visibility map for a single instant using uniform grid.
 

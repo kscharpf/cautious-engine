@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from typing import Tuple, Optional, NamedTuple
 
 from sgp4.api import Satrec, jday
-from sgp4 import exporter
 import numpy as np
 
 

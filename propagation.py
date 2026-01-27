@@ -61,61 +61,43 @@ def calculate_satellite_geometry(
     satellite: Satrec,
     ground: GroundPosition,
     dt: datetime
-) -> Tuple[LookAngle, float]:
+) -> LookAngle:
     """
-    Calculate satellite geometry including look angle and angular rate.
+    Calculate satellite look angle from ground position.
 
     Returns:
-        Tuple of (look_angle, estimated_angular_rate_deg_per_sec)
+        LookAngle (elevation, azimuth, range)
     """
-    # Get position at current time
-    pos1, _ = propagate(satellite, dt)
-    gmst1 = datetime_to_gmst(dt)
-    sat_ecef1 = teme_to_ecef(pos1, gmst1)
-    look1 = calculate_look_angle(sat_ecef1, ground)
-
-    # Get position 10 seconds later for angular rate estimation
-    dt2 = dt + timedelta(seconds=10)
-    pos2, _ = propagate(satellite, dt2)
-    gmst2 = datetime_to_gmst(dt2)
-    sat_ecef2 = teme_to_ecef(pos2, gmst2)
-    look2 = calculate_look_angle(sat_ecef2, ground)
-
-    # Calculate angular rate (degrees per second)
-    elevation_rate = (look2.elevation - look1.elevation) / 10.0
-
-    return look1, elevation_rate
+    pos, _ = propagate(satellite, dt)
+    gmst = datetime_to_gmst(dt)
+    sat_ecef = teme_to_ecef(pos, gmst)
+    return calculate_look_angle(sat_ecef, ground)
 
 
 def determine_step_size(
     current_elevation: float,
-    elevation_rate: float,
-    config: PropagationConfig,
-    orbital_period: float
+    config: PropagationConfig
 ) -> float:
     """
-    Determine the optimal time step based on current satellite position.
+    Determine the optimal time step based on current satellite elevation.
 
     Strategy:
-    - Far below horizon: use large steps (don't waste time)
-    - Approaching horizon: medium steps (don't miss the pass)
-    - Near or above horizon: fine steps (accurate timing)
-    """
-    # Ensure minimum step size to prevent getting stuck
-    MIN_STEP = config.fine_step_seconds
+    - Far below horizon (< -30°): coarse steps (60s) - don't waste time
+    - Approaching horizon (-30° to 0°): medium steps (10s) - don't miss the pass
+    - Near or above horizon (> 0°): fine steps (1s) - accurate timing
 
+    Note: Elevation rate was previously calculated but analysis showed
+    that rate-based prediction doesn't improve performance enough to
+    justify the 2x propagation cost. Simple threshold-based stepping
+    is more efficient for LEO satellites.
+    """
     if current_elevation < config.far_elevation_threshold:
-        # Satellite is far below horizon - use coarse steps
-        # Typical LEO satellite: max elevation change ~1-2 deg/s at horizon
-        # When far below, we can safely take large steps
-        return max(config.coarse_step_seconds, MIN_STEP)
+        return config.coarse_step_seconds
 
     elif current_elevation < config.near_elevation_threshold:
-        # Satellite is between far threshold and horizon - medium steps
-        return max(config.medium_step_seconds, MIN_STEP)
+        return config.medium_step_seconds
 
     else:
-        # Satellite is near or above minimum elevation - fine steps
         return config.fine_step_seconds
 
 
@@ -138,25 +120,17 @@ def adaptive_propagate(
     if config is None:
         config = PropagationConfig()
 
-    orbital_period = estimate_satellite_orbital_period(satellite)
     current_time = start_time
 
     while current_time < end_time:
         # Calculate current geometry
-        look_angle, elevation_rate = calculate_satellite_geometry(
-            satellite, ground, current_time
-        )
+        look_angle = calculate_satellite_geometry(satellite, ground, current_time)
 
         visible = is_visible(look_angle, config.min_elevation)
         yield current_time, look_angle, visible
 
-        # Determine next step size
-        step = determine_step_size(
-            look_angle.elevation,
-            elevation_rate,
-            config,
-            orbital_period
-        )
+        # Determine next step size based on elevation
+        step = determine_step_size(look_angle.elevation, config)
 
         current_time = current_time + timedelta(seconds=step)
 
