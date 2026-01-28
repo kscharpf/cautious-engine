@@ -17,7 +17,9 @@ import numpy as np
 
 from satellite import (
     Satrec, parse_tle, propagate, datetime_to_gmst, teme_to_ecef,
-    calculate_look_angle, geodetic_to_ecef, is_visible, GroundPosition
+    calculate_look_angle, geodetic_to_ecef, is_visible, GroundPosition,
+    GroundGridCache, propagate_constellation_batch, calculate_visibility_numba,
+    compute_coverage_map_optimized, NUMBA_AVAILABLE
 )
 from constellation import (
     Constellation, SAMPLE_STARLINK_TLES, ConstellationConfig,
@@ -283,14 +285,24 @@ async def get_coverage_map(
     duration_hours: float = 24.0,
     step_minutes: float = 5.0,
     min_elevation: float = 10.0,
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None,
+    parallel_workers: int = 4
 ):
     """
     Calculate coverage percentage map over a time period.
 
     Returns coverage percentages (0-100) for each 1° lat/lon grid cell.
     Also returns suggested gradation breaks based on data distribution.
+
+    Uses high-performance optimizations:
+    - Precomputed ground grid cache
+    - Vectorized multi-satellite visibility
+    - Numba JIT compilation (if available)
+    - Parallel time step processing
     """
+    import time as time_module
+    calc_start = time_module.perf_counter()
+
     constellation = get_constellation(session_id)
 
     if timestamp:
@@ -305,39 +317,18 @@ async def get_coverage_map(
     lats = np.arange(-90, 90, 1.0)
     lons = np.arange(-180, 180, 1.0)
 
-    # Initialize coverage counts
-    visible_counts = np.zeros((len(lats), len(lons)), dtype=np.int32)
-    total_steps = 0
-
-    # Precompute ground positions in ECEF (vectorized)
-    from satellite import geodetic_to_ecef_grid, calculate_visibility_grid_multi_sat
-    ground_x, ground_y, ground_z = geodetic_to_ecef_grid(lats, lons, alt=0.0)
-
-    # Iterate through time steps
-    current = start_dt
-    while current < end_dt:
-        gmst = datetime_to_gmst(current)
-
-        # Get all satellite positions at this time
-        sat_positions = []
-        for name, sat in constellation.satellites:
-            try:
-                pos, _ = propagate(sat, current)
-                sat_ecef = teme_to_ecef(pos, gmst)
-                sat_positions.append(sat_ecef)
-            except ValueError:
-                continue
-
-        if sat_positions:
-            # Vectorized visibility check for entire grid
-            visibility = calculate_visibility_grid_multi_sat(
-                sat_positions, ground_x, ground_y, ground_z,
-                lats, lons, min_elevation
-            )
-            visible_counts += visibility.astype(np.int32)
-
-        total_steps += 1
-        current += timedelta(minutes=step_minutes)
+    # Use optimized coverage calculation
+    visible_counts, total_steps = compute_coverage_map_optimized(
+        satellites=constellation.satellites,
+        start_time=start_dt,
+        end_time=end_dt,
+        step_minutes=step_minutes,
+        lats=lats,
+        lons=lons,
+        min_elevation=min_elevation,
+        use_numba=NUMBA_AVAILABLE,
+        n_workers=parallel_workers
+    )
 
     # Convert counts to percentages
     if total_steps > 0:
@@ -351,7 +342,6 @@ async def get_coverage_map(
 
     # Determine gradation breaks
     if len(non_zero) == 0:
-        # No coverage anywhere
         gradations = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     else:
         min_cov = float(np.min(non_zero))
@@ -359,13 +349,10 @@ async def get_coverage_map(
         range_cov = max_cov - min_cov
 
         if range_cov < 20:
-            # Narrow range - use percentile-based gradations
             percentiles = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
             gradations = [float(np.percentile(non_zero, p)) for p in percentiles]
-            # Ensure unique values
             gradations = sorted(list(set([round(g, 1) for g in gradations])))
         else:
-            # Wide range - use standard 10% gradations
             gradations = list(range(0, 101, 10))
 
     # Calculate distribution for legend
@@ -374,6 +361,8 @@ async def get_coverage_map(
         low, high = gradations[i], gradations[i + 1]
         count = np.sum((coverage_pct >= low) & (coverage_pct < high))
         distribution[f"{low:.0f}-{high:.0f}"] = int(count)
+
+    calc_elapsed = time_module.perf_counter() - calc_start
 
     return {
         "start": start_dt.isoformat(),
@@ -393,6 +382,11 @@ async def get_coverage_map(
             "median": float(np.median(coverage_pct)),
             "non_zero_min": float(np.min(non_zero)) if len(non_zero) > 0 else 0,
             "non_zero_count": int(np.sum(coverage_pct > 0))
+        },
+        "performance": {
+            "calculation_time_seconds": round(calc_elapsed, 2),
+            "numba_enabled": NUMBA_AVAILABLE,
+            "parallel_workers": parallel_workers
         },
         "session_id": session_id
     }

@@ -8,11 +8,24 @@ This module provides functionality for:
 """
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Tuple, Optional, NamedTuple
 
 from sgp4.api import Satrec, jday
 import numpy as np
+
+# Try to import numba for JIT compilation (optional but recommended)
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Provide fallback decorator
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
 
 
 # Constants
@@ -434,6 +447,406 @@ def calculate_visibility_at_time(
     visible = is_visible(look_angle, min_elevation)
 
     return look_angle, visible
+
+
+# =============================================================================
+# HIGH-PERFORMANCE OPTIMIZED FUNCTIONS
+# =============================================================================
+
+class GroundGridCache:
+    """
+    Precomputed ground grid data for fast repeated visibility calculations.
+
+    Caches all ground-related trigonometry and ECEF coordinates so they
+    don't need to be recomputed for each satellite or time step.
+    """
+    __slots__ = ['lats', 'lons', 'ground_x', 'ground_y', 'ground_z',
+                 'sin_lat', 'cos_lat', 'sin_lon', 'cos_lon', 'shape']
+
+    def __init__(self, lats: np.ndarray, lons: np.ndarray, alt: float = 0.0):
+        """
+        Precompute all ground-related values once.
+
+        Args:
+            lats: 1D array of latitudes in degrees
+            lons: 1D array of longitudes in degrees
+            alt: Ground altitude in km (same for all points)
+        """
+        self.lats = lats
+        self.lons = lons
+        self.shape = (len(lats), len(lons))
+
+        # Create 2D meshgrid
+        lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')
+
+        # Convert to radians
+        lat_rad = np.radians(lat_grid)
+        lon_rad = np.radians(lon_grid)
+
+        # Cache trig values (most expensive repeated operation)
+        self.sin_lat = np.sin(lat_rad).astype(np.float32)
+        self.cos_lat = np.cos(lat_rad).astype(np.float32)
+        self.sin_lon = np.sin(lon_rad).astype(np.float32)
+        self.cos_lon = np.cos(lon_rad).astype(np.float32)
+
+        # Ground ECEF coordinates
+        N = WGS84_A / np.sqrt(1 - WGS84_E2 * self.sin_lat**2)
+        self.ground_x = ((N + alt) * self.cos_lat * self.cos_lon).astype(np.float32)
+        self.ground_y = ((N + alt) * self.cos_lat * self.sin_lon).astype(np.float32)
+        self.ground_z = ((N * (1 - WGS84_E2) + alt) * self.sin_lat).astype(np.float32)
+
+
+def propagate_constellation_batch(
+    satellites: list,
+    dt: datetime
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Propagate all satellites to a single time using optimized batch processing.
+
+    Args:
+        satellites: List of (name, Satrec) tuples
+        dt: Datetime for propagation (UTC)
+
+    Returns:
+        Tuple of (sat_x, sat_y, sat_z, valid_mask) arrays
+        - sat_x, sat_y, sat_z: ECEF coordinates in km, shape (n_sats,)
+        - valid_mask: Boolean array indicating successful propagation
+    """
+    n_sats = len(satellites)
+
+    # Prepare output arrays
+    sat_x = np.zeros(n_sats, dtype=np.float32)
+    sat_y = np.zeros(n_sats, dtype=np.float32)
+    sat_z = np.zeros(n_sats, dtype=np.float32)
+    valid_mask = np.ones(n_sats, dtype=bool)
+
+    # Compute GMST once for TEME->ECEF conversion
+    gmst = datetime_to_gmst(dt)
+    cos_gmst = np.float32(math.cos(gmst))
+    sin_gmst = np.float32(math.sin(gmst))
+
+    # Convert datetime to Julian date once
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    jd, fr = jday(dt.year, dt.month, dt.day, dt.hour, dt.minute,
+                  dt.second + dt.microsecond / 1e6)
+
+    # Propagate each satellite
+    for i, (name, sat) in enumerate(satellites):
+        try:
+            error, position, velocity = sat.sgp4(jd, fr)
+            if error != 0:
+                valid_mask[i] = False
+                continue
+
+            # TEME to ECEF rotation
+            x_teme, y_teme, z_teme = position
+            sat_x[i] = x_teme * cos_gmst + y_teme * sin_gmst
+            sat_y[i] = -x_teme * sin_gmst + y_teme * cos_gmst
+            sat_z[i] = z_teme
+
+        except Exception:
+            valid_mask[i] = False
+
+    return sat_x, sat_y, sat_z, valid_mask
+
+
+def calculate_visibility_vectorized(
+    sat_x: np.ndarray,
+    sat_y: np.ndarray,
+    sat_z: np.ndarray,
+    valid_mask: np.ndarray,
+    cache: GroundGridCache,
+    min_elevation: float = 10.0
+) -> np.ndarray:
+    """
+    Fully vectorized visibility calculation for multiple satellites.
+
+    Uses NumPy broadcasting to compute visibility for all satellites
+    and all ground points simultaneously.
+
+    Args:
+        sat_x, sat_y, sat_z: Satellite ECEF coordinates, shape (n_sats,)
+        valid_mask: Boolean mask for valid satellites
+        cache: Precomputed ground grid cache
+        min_elevation: Minimum elevation angle in degrees
+
+    Returns:
+        visibility: Boolean array (n_lats, n_lons), True where any sat visible
+    """
+    # Filter to valid satellites only
+    sat_x = sat_x[valid_mask]
+    sat_y = sat_y[valid_mask]
+    sat_z = sat_z[valid_mask]
+
+    if len(sat_x) == 0:
+        return np.zeros(cache.shape, dtype=bool)
+
+    n_sats = len(sat_x)
+
+    # Reshape satellite positions for broadcasting: (n_sats,) -> (n_sats, 1, 1)
+    sat_x = sat_x[:, np.newaxis, np.newaxis]
+    sat_y = sat_y[:, np.newaxis, np.newaxis]
+    sat_z = sat_z[:, np.newaxis, np.newaxis]
+
+    # Range vectors: (n_sats, n_lats, n_lons)
+    range_x = sat_x - cache.ground_x
+    range_y = sat_y - cache.ground_y
+    range_z = sat_z - cache.ground_z
+
+    # SEZ transformation using cached trig values
+    # S component: sin(lat)*cos(lon)*rx + sin(lat)*sin(lon)*ry - cos(lat)*rz
+    s = (cache.sin_lat * cache.cos_lon * range_x +
+         cache.sin_lat * cache.sin_lon * range_y -
+         cache.cos_lat * range_z)
+
+    # E component: -sin(lon)*rx + cos(lon)*ry
+    e = -cache.sin_lon * range_x + cache.cos_lon * range_y
+
+    # Z component: cos(lat)*cos(lon)*rx + cos(lat)*sin(lon)*ry + sin(lat)*rz
+    z = (cache.cos_lat * cache.cos_lon * range_x +
+         cache.cos_lat * cache.sin_lon * range_y +
+         cache.sin_lat * range_z)
+
+    # Elevation calculation: (n_sats, n_lats, n_lons)
+    horizontal_range = np.sqrt(s**2 + e**2)
+    elevation = np.degrees(np.arctan2(z, horizontal_range))
+
+    # Any satellite visible at each point? Reduce across satellite axis
+    visible = np.any(elevation >= min_elevation, axis=0)
+
+    return visible
+
+
+# Numba-accelerated version for even faster computation
+if NUMBA_AVAILABLE:
+    @njit(parallel=True, fastmath=True, cache=True)
+    def _visibility_numba_kernel(
+        sat_x: np.ndarray,
+        sat_y: np.ndarray,
+        sat_z: np.ndarray,
+        ground_x: np.ndarray,
+        ground_y: np.ndarray,
+        ground_z: np.ndarray,
+        sin_lat: np.ndarray,
+        cos_lat: np.ndarray,
+        sin_lon: np.ndarray,
+        cos_lon: np.ndarray,
+        min_elev_rad: float
+    ) -> np.ndarray:
+        """
+        Numba JIT-compiled visibility kernel with early exit optimization.
+
+        Parallelized across latitude rows for efficient CPU utilization.
+        """
+        n_sats = len(sat_x)
+        n_lats, n_lons = ground_x.shape
+        visible = np.zeros((n_lats, n_lons), dtype=np.bool_)
+
+        for i in prange(n_lats):
+            for j in range(n_lons):
+                gx = ground_x[i, j]
+                gy = ground_y[i, j]
+                gz = ground_z[i, j]
+                sl = sin_lat[i, j]
+                cl = cos_lat[i, j]
+                slo = sin_lon[i, j]
+                clo = cos_lon[i, j]
+
+                for k in range(n_sats):
+                    # Range vector
+                    rx = sat_x[k] - gx
+                    ry = sat_y[k] - gy
+                    rz = sat_z[k] - gz
+
+                    # SEZ transformation
+                    s = sl * clo * rx + sl * slo * ry - cl * rz
+                    e = -slo * rx + clo * ry
+                    z = cl * clo * rx + cl * slo * ry + sl * rz
+
+                    # Elevation check (using atan2 approximation for speed)
+                    horiz = math.sqrt(s * s + e * e)
+                    elev = math.atan2(z, horiz)
+
+                    if elev >= min_elev_rad:
+                        visible[i, j] = True
+                        break  # Early exit - no need to check other sats
+
+        return visible
+
+
+def calculate_visibility_numba(
+    sat_x: np.ndarray,
+    sat_y: np.ndarray,
+    sat_z: np.ndarray,
+    valid_mask: np.ndarray,
+    cache: GroundGridCache,
+    min_elevation: float = 10.0
+) -> np.ndarray:
+    """
+    Numba-accelerated visibility calculation with early exit optimization.
+
+    Falls back to vectorized version if Numba is not available.
+
+    Args:
+        sat_x, sat_y, sat_z: Satellite ECEF coordinates, shape (n_sats,)
+        valid_mask: Boolean mask for valid satellites
+        cache: Precomputed ground grid cache
+        min_elevation: Minimum elevation angle in degrees
+
+    Returns:
+        visibility: Boolean array (n_lats, n_lons)
+    """
+    if not NUMBA_AVAILABLE:
+        return calculate_visibility_vectorized(
+            sat_x, sat_y, sat_z, valid_mask, cache, min_elevation
+        )
+
+    # Filter to valid satellites
+    sat_x = np.ascontiguousarray(sat_x[valid_mask].astype(np.float64))
+    sat_y = np.ascontiguousarray(sat_y[valid_mask].astype(np.float64))
+    sat_z = np.ascontiguousarray(sat_z[valid_mask].astype(np.float64))
+
+    if len(sat_x) == 0:
+        return np.zeros(cache.shape, dtype=bool)
+
+    min_elev_rad = np.radians(min_elevation)
+
+    return _visibility_numba_kernel(
+        sat_x, sat_y, sat_z,
+        cache.ground_x.astype(np.float64),
+        cache.ground_y.astype(np.float64),
+        cache.ground_z.astype(np.float64),
+        cache.sin_lat.astype(np.float64),
+        cache.cos_lat.astype(np.float64),
+        cache.sin_lon.astype(np.float64),
+        cache.cos_lon.astype(np.float64),
+        min_elev_rad
+    )
+
+
+def compute_coverage_map_optimized(
+    satellites: list,
+    start_time: datetime,
+    end_time: datetime,
+    step_minutes: float,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    min_elevation: float = 10.0,
+    use_numba: bool = True,
+    n_workers: int = 4
+) -> Tuple[np.ndarray, int]:
+    """
+    Compute coverage map with all optimizations enabled.
+
+    This is the main entry point for high-performance coverage calculation.
+
+    Args:
+        satellites: List of (name, Satrec) tuples
+        start_time: Start datetime (UTC)
+        end_time: End datetime (UTC)
+        step_minutes: Time step in minutes
+        lats: 1D array of latitudes
+        lons: 1D array of longitudes
+        min_elevation: Minimum elevation angle in degrees
+        use_numba: Whether to use Numba JIT (if available)
+        n_workers: Number of parallel workers for time steps
+
+    Returns:
+        Tuple of (coverage_counts, total_steps)
+        - coverage_counts: Integer array (n_lats, n_lons) of visible time steps
+        - total_steps: Total number of time steps computed
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from functools import partial
+
+    # Precompute ground grid cache once
+    cache = GroundGridCache(lats, lons, alt=0.0)
+
+    # Generate all time steps
+    times = []
+    current = start_time
+    while current < end_time:
+        times.append(current)
+        current += timedelta(minutes=step_minutes)
+
+    total_steps = len(times)
+
+    # Choose visibility function
+    visibility_func = calculate_visibility_numba if use_numba else calculate_visibility_vectorized
+
+    def process_timestep(dt: datetime) -> np.ndarray:
+        """Process a single time step."""
+        sat_x, sat_y, sat_z, valid_mask = propagate_constellation_batch(satellites, dt)
+        return visibility_func(sat_x, sat_y, sat_z, valid_mask, cache, min_elevation)
+
+    # Initialize accumulator
+    coverage_counts = np.zeros(cache.shape, dtype=np.int32)
+
+    # Process time steps (parallel or sequential based on n_workers)
+    if n_workers > 1 and total_steps > 10:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            results = executor.map(process_timestep, times)
+            for visibility in results:
+                coverage_counts += visibility.astype(np.int32)
+    else:
+        for dt in times:
+            visibility = process_timestep(dt)
+            coverage_counts += visibility.astype(np.int32)
+
+    return coverage_counts, total_steps
+
+
+def benchmark_visibility_methods(
+    satellites: list,
+    dt: datetime,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    min_elevation: float = 10.0,
+    n_iterations: int = 5
+) -> dict:
+    """
+    Benchmark different visibility calculation methods.
+
+    Returns timing information for comparison.
+    """
+    import time
+
+    results = {}
+
+    # Precompute cache
+    cache = GroundGridCache(lats, lons, alt=0.0)
+
+    # Propagate satellites once
+    sat_x, sat_y, sat_z, valid_mask = propagate_constellation_batch(satellites, dt)
+
+    # Benchmark vectorized version
+    times_vec = []
+    for _ in range(n_iterations):
+        start = time.perf_counter()
+        _ = calculate_visibility_vectorized(sat_x, sat_y, sat_z, valid_mask, cache, min_elevation)
+        times_vec.append(time.perf_counter() - start)
+    results['vectorized'] = {
+        'mean_ms': np.mean(times_vec) * 1000,
+        'std_ms': np.std(times_vec) * 1000
+    }
+
+    # Benchmark Numba version (if available)
+    if NUMBA_AVAILABLE:
+        # Warm up JIT
+        _ = calculate_visibility_numba(sat_x, sat_y, sat_z, valid_mask, cache, min_elevation)
+
+        times_numba = []
+        for _ in range(n_iterations):
+            start = time.perf_counter()
+            _ = calculate_visibility_numba(sat_x, sat_y, sat_z, valid_mask, cache, min_elevation)
+            times_numba.append(time.perf_counter() - start)
+        results['numba'] = {
+            'mean_ms': np.mean(times_numba) * 1000,
+            'std_ms': np.std(times_numba) * 1000
+        }
+
+    return results
 
 
 # =============================================================================
