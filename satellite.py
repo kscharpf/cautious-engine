@@ -23,6 +23,11 @@ RAD_TO_DEG = 180.0 / math.pi
 # Earth's rotation rate (rad/s) - WGS84
 EARTH_ROTATION_RATE = 7.2921150e-5
 
+# WGS84 ellipsoid parameters (precomputed for efficiency)
+WGS84_A = 6378.137  # Equatorial radius (km)
+WGS84_F = 1 / 298.257223563  # Flattening
+WGS84_E2 = 2 * WGS84_F - WGS84_F**2  # Eccentricity squared (~0.00669437999014)
+
 
 class Position(NamedTuple):
     """Position in TEME frame (km)."""
@@ -133,11 +138,6 @@ def geodetic_to_ecef(ground: GroundPosition) -> Position:
 
     Uses WGS84 ellipsoid parameters.
     """
-    # WGS84 parameters
-    a = 6378.137  # Equatorial radius (km)
-    f = 1 / 298.257223563  # Flattening
-    e2 = 2 * f - f**2  # Eccentricity squared
-
     lat_rad = ground.latitude * DEG_TO_RAD
     lon_rad = ground.longitude * DEG_TO_RAD
     alt = ground.altitude
@@ -148,11 +148,11 @@ def geodetic_to_ecef(ground: GroundPosition) -> Position:
     sin_lon = math.sin(lon_rad)
 
     # Radius of curvature in prime vertical
-    N = a / math.sqrt(1 - e2 * sin_lat**2)
+    N = WGS84_A / math.sqrt(1 - WGS84_E2 * sin_lat**2)
 
     x = (N + alt) * cos_lat * cos_lon
     y = (N + alt) * cos_lat * sin_lon
-    z = (N * (1 - e2) + alt) * sin_lat
+    z = (N * (1 - WGS84_E2) + alt) * sin_lat
 
     return Position(x, y, z)
 
@@ -218,6 +218,193 @@ def is_visible(look_angle: LookAngle, min_elevation: float = 10.0) -> bool:
         True if satellite is above minimum elevation angle
     """
     return look_angle.elevation >= min_elevation
+
+
+# =============================================================================
+# VECTORIZED FUNCTIONS FOR GRID CALCULATIONS
+# =============================================================================
+
+def geodetic_to_ecef_grid(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    alt: float = 0.0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Convert geodetic coordinates to ECEF for a 2D grid of lat/lon points.
+
+    Uses WGS84 ellipsoid parameters. Vectorized for performance.
+
+    Args:
+        lats: 1D array of latitudes in degrees (n_lats,)
+        lons: 1D array of longitudes in degrees (n_lons,)
+        alt: Altitude in km (scalar, same for all points)
+
+    Returns:
+        Tuple of (x, y, z) arrays, each with shape (n_lats, n_lons)
+    """
+    # Create 2D meshgrid
+    lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')
+
+    # Convert to radians
+    lat_rad = np.radians(lat_grid)
+    lon_rad = np.radians(lon_grid)
+
+    cos_lat = np.cos(lat_rad)
+    sin_lat = np.sin(lat_rad)
+    cos_lon = np.cos(lon_rad)
+    sin_lon = np.sin(lon_rad)
+
+    # Radius of curvature in prime vertical
+    N = WGS84_A / np.sqrt(1 - WGS84_E2 * sin_lat**2)
+
+    x = (N + alt) * cos_lat * cos_lon
+    y = (N + alt) * cos_lat * sin_lon
+    z = (N * (1 - WGS84_E2) + alt) * sin_lat
+
+    return x, y, z
+
+
+def calculate_look_angles_grid(
+    satellite_ecef: Position,
+    ground_x: np.ndarray,
+    ground_y: np.ndarray,
+    ground_z: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate look angles from a grid of ground positions to a satellite.
+
+    Vectorized implementation using NumPy broadcasting.
+
+    Args:
+        satellite_ecef: Satellite position in ECEF (km)
+        ground_x, ground_y, ground_z: Ground position arrays in ECEF (n_lats, n_lons)
+        lats: 1D array of latitudes in degrees
+        lons: 1D array of longitudes in degrees
+
+    Returns:
+        Tuple of (elevation, azimuth, range_km) arrays, each (n_lats, n_lons)
+    """
+    # Range vector from ground to satellite (in ECEF)
+    range_x = satellite_ecef.x - ground_x
+    range_y = satellite_ecef.y - ground_y
+    range_z = satellite_ecef.z - ground_z
+
+    # Range magnitude
+    range_km = np.sqrt(range_x**2 + range_y**2 + range_z**2)
+
+    # Create 2D lat/lon grids for rotation matrix computation
+    lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')
+    lat_rad = np.radians(lat_grid)
+    lon_rad = np.radians(lon_grid)
+
+    sin_lat = np.sin(lat_rad)
+    cos_lat = np.cos(lat_rad)
+    sin_lon = np.sin(lon_rad)
+    cos_lon = np.cos(lon_rad)
+
+    # Apply SEZ rotation (South-East-Zenith local frame)
+    # S component: sin(lat)*cos(lon)*rx + sin(lat)*sin(lon)*ry - cos(lat)*rz
+    s = sin_lat * cos_lon * range_x + sin_lat * sin_lon * range_y - cos_lat * range_z
+
+    # E component: -sin(lon)*rx + cos(lon)*ry
+    e = -sin_lon * range_x + cos_lon * range_y
+
+    # Z component: cos(lat)*cos(lon)*rx + cos(lat)*sin(lon)*ry + sin(lat)*rz
+    z = cos_lat * cos_lon * range_x + cos_lat * sin_lon * range_y + sin_lat * range_z
+
+    # Calculate elevation (angle above horizon)
+    horizontal_range = np.sqrt(s**2 + e**2)
+    elevation = np.degrees(np.arctan2(z, horizontal_range))
+
+    # Calculate azimuth (angle from north, clockwise)
+    azimuth = np.degrees(np.arctan2(e, -s))
+    azimuth = np.where(azimuth < 0, azimuth + 360, azimuth)
+
+    return elevation, azimuth, range_km
+
+
+def calculate_visibility_grid(
+    satellite: Satrec,
+    dt: datetime,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    min_elevation: float = 10.0,
+    alt: float = 0.0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate visibility for an entire lat/lon grid at a single time instant.
+
+    This is the main vectorized entry point for coverage map calculations.
+    Computes satellite position once, then evaluates all ground points in parallel.
+
+    Args:
+        satellite: SGP4 satellite object
+        dt: Datetime for calculation (UTC)
+        lats: 1D array of latitudes in degrees
+        lons: 1D array of longitudes in degrees
+        min_elevation: Minimum elevation for visibility in degrees
+        alt: Ground altitude in km (same for all points)
+
+    Returns:
+        Tuple of:
+        - visibility: Boolean array (n_lats, n_lons), True where visible
+        - elevation: Elevation angles in degrees (n_lats, n_lons)
+        - azimuth: Azimuth angles in degrees (n_lats, n_lons)
+        - range_km: Range to satellite in km (n_lats, n_lons)
+    """
+    # Propagate satellite once
+    pos, _ = propagate(satellite, dt)
+    gmst = datetime_to_gmst(dt)
+    sat_ecef = teme_to_ecef(pos, gmst)
+
+    # Convert all ground positions to ECEF (vectorized)
+    ground_x, ground_y, ground_z = geodetic_to_ecef_grid(lats, lons, alt)
+
+    # Calculate look angles for entire grid (vectorized)
+    elevation, azimuth, range_km = calculate_look_angles_grid(
+        sat_ecef, ground_x, ground_y, ground_z, lats, lons
+    )
+
+    # Determine visibility
+    visibility = elevation >= min_elevation
+
+    return visibility, elevation, azimuth, range_km
+
+
+def calculate_visibility_grid_multi_sat(
+    sat_ecef_list: list,
+    ground_x: np.ndarray,
+    ground_y: np.ndarray,
+    ground_z: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    min_elevation: float = 10.0
+) -> np.ndarray:
+    """
+    Calculate visibility for a grid from multiple satellites.
+
+    Returns True at each point if ANY satellite is visible.
+
+    Args:
+        sat_ecef_list: List of satellite Position objects in ECEF
+        ground_x, ground_y, ground_z: Ground ECEF coordinates (n_lats, n_lons)
+        lats, lons: 1D arrays of lat/lon values
+        min_elevation: Minimum elevation for visibility
+
+    Returns:
+        visibility: Boolean array (n_lats, n_lons), True where any sat visible
+    """
+    visibility = np.zeros((len(lats), len(lons)), dtype=bool)
+
+    for sat_ecef in sat_ecef_list:
+        elevation, _, _ = calculate_look_angles_grid(
+            sat_ecef, ground_x, ground_y, ground_z, lats, lons
+        )
+        visibility |= (elevation >= min_elevation)
+
+    return visibility
 
 
 def calculate_visibility_at_time(

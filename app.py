@@ -4,35 +4,83 @@ FastAPI backend for satellite coverage visualization.
 Provides REST API endpoints for calculating satellite positions and coverage.
 """
 
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Dict
 from dataclasses import dataclass
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 import numpy as np
 
 from satellite import (
     Satrec, parse_tle, propagate, datetime_to_gmst, teme_to_ecef,
     calculate_look_angle, geodetic_to_ecef, is_visible, GroundPosition
 )
-from constellation import Constellation, SAMPLE_STARLINK_TLES
+from constellation import (
+    Constellation, SAMPLE_STARLINK_TLES, ConstellationConfig,
+    calculate_constellation_coverage_at_point
+)
+from propagation import (
+    find_visibility_windows, PropagationConfig, calculate_satellite_geometry
+)
+from tle_loader import (
+    parse_tle_text, fetch_tle_from_url, fetch_celestrak_preset,
+    get_celestrak_presets, TLEParseError, TLEFetchError
+)
 
 app = FastAPI(title="Satellite Coverage Visualizer")
 
-# Sample constellation (initialized once)
-CONSTELLATION = Constellation("Demo Constellation")
+# Session storage for user constellations
+# In production, use Redis or a database
+SESSION_STORE: Dict[str, dict] = {}
 
-# Add ISS
-CONSTELLATION.add_satellite(
-    "ISS (ZARYA)",
-    "1 25544U 98067A   20045.18587073  .00000950  00000-0  25302-4 0  9990",
-    "2 25544  51.6443 242.2052 0004885 264.6463 206.3557 15.49165514212791"
-)
 
-# Add Starlink satellites
-CONSTELLATION.add_from_tle_list(SAMPLE_STARLINK_TLES)
+def get_default_constellation() -> Constellation:
+    """Create the default constellation with ISS and Starlink samples."""
+    constellation = Constellation("Default Constellation")
+    constellation.add_satellite(
+        "ISS (ZARYA)",
+        "1 25544U 98067A   20045.18587073  .00000950  00000-0  25302-4 0  9990",
+        "2 25544  51.6443 242.2052 0004885 264.6463 206.3557 15.49165514212791"
+    )
+    constellation.add_from_tle_list(SAMPLE_STARLINK_TLES)
+    return constellation
+
+
+# Default constellation (for backwards compatibility)
+DEFAULT_CONSTELLATION = get_default_constellation()
+
+
+def get_constellation(session_id: Optional[str] = None) -> Constellation:
+    """Get constellation for a session, or the default."""
+    if session_id and session_id in SESSION_STORE:
+        return SESSION_STORE[session_id]['constellation']
+    return DEFAULT_CONSTELLATION
+
+
+# Pydantic models for request/response
+class LoadTLERequest(BaseModel):
+    tle_text: Optional[str] = None
+    celestrak_preset: Optional[str] = None
+    tle_url: Optional[str] = None
+
+
+class CoverageRequest(BaseModel):
+    latitude: float
+    longitude: float
+    altitude_km: float = 0.0
+    duration_hours: float = 24.0
+    min_elevation: float = 10.0
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    source: str
+    satellite_count: int
+    satellites: List[str]
 
 
 @app.get("/")
@@ -42,47 +90,43 @@ async def root():
 
 
 @app.get("/api/satellites")
-async def get_satellites():
+async def get_satellites(session_id: Optional[str] = None):
     """Get list of satellites in the constellation."""
+    constellation = get_constellation(session_id)
     return {
-        "satellites": [name for name, _ in CONSTELLATION.satellites],
-        "count": CONSTELLATION.size
+        "satellites": [name for name, _ in constellation.satellites],
+        "count": constellation.size,
+        "session_id": session_id
     }
 
 
 @app.get("/api/positions")
 async def get_satellite_positions(
     timestamp: Optional[str] = None,
-    offset_minutes: int = 0
+    offset_minutes: int = 0,
+    session_id: Optional[str] = None
 ):
-    """
-    Get current positions of all satellites.
+    """Get current positions of all satellites."""
+    constellation = get_constellation(session_id)
 
-    Args:
-        timestamp: ISO format timestamp (default: now)
-        offset_minutes: Offset from timestamp in minutes
-    """
     if timestamp:
         dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
     else:
-        # Use a fixed time for reproducibility in demo
         dt = datetime(2020, 2, 14, 12, 0, 0, tzinfo=timezone.utc)
 
     dt = dt + timedelta(minutes=offset_minutes)
     gmst = datetime_to_gmst(dt)
 
     positions = []
-    for name, sat in CONSTELLATION.satellites:
+    for name, sat in constellation.satellites:
         try:
             pos, vel = propagate(sat, dt)
             sat_ecef = teme_to_ecef(pos, gmst)
 
-            # Convert ECEF to lat/lon/alt
-            # Simple conversion (not accounting for ellipsoid perfectly)
             r = np.sqrt(sat_ecef.x**2 + sat_ecef.y**2 + sat_ecef.z**2)
             lat = np.arcsin(sat_ecef.z / r) * 180 / np.pi
             lon = np.arctan2(sat_ecef.y, sat_ecef.x) * 180 / np.pi
-            alt = r - 6371  # Approximate altitude in km
+            alt = r - 6371
 
             positions.append({
                 "name": name,
@@ -91,13 +135,13 @@ async def get_satellite_positions(
                 "altitude_km": float(alt),
                 "velocity_km_s": float(np.sqrt(vel.vx**2 + vel.vy**2 + vel.vz**2))
             })
-        except ValueError as e:
-            # Propagation error
+        except ValueError:
             continue
 
     return {
         "timestamp": dt.isoformat(),
-        "positions": positions
+        "positions": positions,
+        "session_id": session_id
     }
 
 
@@ -106,13 +150,12 @@ async def get_instant_coverage(
     timestamp: Optional[str] = None,
     offset_minutes: int = 0,
     resolution: float = 5.0,
-    min_elevation: float = 10.0
+    min_elevation: float = 10.0,
+    session_id: Optional[str] = None
 ):
-    """
-    Get coverage map for a single instant.
+    """Get coverage map for a single instant."""
+    constellation = get_constellation(session_id)
 
-    Returns a grid of visibility values (0 or 1).
-    """
     if timestamp:
         dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
     else:
@@ -121,13 +164,11 @@ async def get_instant_coverage(
     dt = dt + timedelta(minutes=offset_minutes)
     gmst = datetime_to_gmst(dt)
 
-    # Create grid
     lats = np.arange(-90, 90, resolution)
     lons = np.arange(-180, 180, resolution)
 
-    # Get satellite positions
     sat_positions = []
-    for name, sat in CONSTELLATION.satellites:
+    for name, sat in constellation.satellites:
         try:
             pos, _ = propagate(sat, dt)
             sat_ecef = teme_to_ecef(pos, gmst)
@@ -135,7 +176,6 @@ async def get_instant_coverage(
         except ValueError:
             continue
 
-    # Calculate visibility grid
     coverage = []
     for lat in lats:
         row = []
@@ -155,7 +195,8 @@ async def get_instant_coverage(
         "resolution": resolution,
         "latitudes": lats.tolist(),
         "longitudes": lons.tolist(),
-        "coverage": coverage
+        "coverage": coverage,
+        "session_id": session_id
     }
 
 
@@ -166,11 +207,12 @@ async def get_point_coverage(
     timestamp: Optional[str] = None,
     duration_hours: float = 24.0,
     step_minutes: float = 1.0,
-    min_elevation: float = 10.0
+    min_elevation: float = 10.0,
+    session_id: Optional[str] = None
 ):
-    """
-    Get time-series coverage for a specific point.
-    """
+    """Get time-series coverage for a specific point."""
+    constellation = get_constellation(session_id)
+
     if timestamp:
         start = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
     else:
@@ -187,11 +229,10 @@ async def get_point_coverage(
     while current < end:
         gmst = datetime_to_gmst(current)
 
-        # Check each satellite
         any_visible = False
         visible_sats = []
 
-        for name, sat in CONSTELLATION.satellites:
+        for name, sat in constellation.satellites:
             try:
                 pos, _ = propagate(sat, current)
                 sat_ecef = teme_to_ecef(pos, gmst)
@@ -226,8 +267,438 @@ async def get_point_coverage(
         "start": start.isoformat(),
         "end": end.isoformat(),
         "coverage_percent": round(coverage_percent, 2),
-        "timeline": timeline[:100]  # Limit response size
+        "timeline": timeline[:100],
+        "session_id": session_id
     }
+
+
+# ============================================================================
+# COVERAGE MAP WITH PERCENTAGE GRADATIONS
+# ============================================================================
+
+@app.get("/api/coverage/map")
+async def get_coverage_map(
+    timestamp: Optional[str] = None,
+    offset_minutes: int = 0,
+    duration_hours: float = 24.0,
+    step_minutes: float = 5.0,
+    min_elevation: float = 10.0,
+    session_id: Optional[str] = None
+):
+    """
+    Calculate coverage percentage map over a time period.
+
+    Returns coverage percentages (0-100) for each 1° lat/lon grid cell.
+    Also returns suggested gradation breaks based on data distribution.
+    """
+    constellation = get_constellation(session_id)
+
+    if timestamp:
+        start_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    else:
+        start_dt = datetime(2020, 2, 14, 0, 0, 0, tzinfo=timezone.utc)
+
+    start_dt = start_dt + timedelta(minutes=offset_minutes)
+    end_dt = start_dt + timedelta(hours=duration_hours)
+
+    # Create 1° resolution grid
+    lats = np.arange(-90, 90, 1.0)
+    lons = np.arange(-180, 180, 1.0)
+
+    # Initialize coverage counts
+    visible_counts = np.zeros((len(lats), len(lons)), dtype=np.int32)
+    total_steps = 0
+
+    # Precompute ground positions in ECEF (vectorized)
+    from satellite import geodetic_to_ecef_grid, calculate_visibility_grid_multi_sat
+    ground_x, ground_y, ground_z = geodetic_to_ecef_grid(lats, lons, alt=0.0)
+
+    # Iterate through time steps
+    current = start_dt
+    while current < end_dt:
+        gmst = datetime_to_gmst(current)
+
+        # Get all satellite positions at this time
+        sat_positions = []
+        for name, sat in constellation.satellites:
+            try:
+                pos, _ = propagate(sat, current)
+                sat_ecef = teme_to_ecef(pos, gmst)
+                sat_positions.append(sat_ecef)
+            except ValueError:
+                continue
+
+        if sat_positions:
+            # Vectorized visibility check for entire grid
+            visibility = calculate_visibility_grid_multi_sat(
+                sat_positions, ground_x, ground_y, ground_z,
+                lats, lons, min_elevation
+            )
+            visible_counts += visibility.astype(np.int32)
+
+        total_steps += 1
+        current += timedelta(minutes=step_minutes)
+
+    # Convert counts to percentages
+    if total_steps > 0:
+        coverage_pct = (visible_counts / total_steps) * 100
+    else:
+        coverage_pct = np.zeros_like(visible_counts, dtype=np.float32)
+
+    # Calculate statistics for dynamic gradation
+    flat_coverage = coverage_pct.flatten()
+    non_zero = flat_coverage[flat_coverage > 0]
+
+    # Determine gradation breaks
+    if len(non_zero) == 0:
+        # No coverage anywhere
+        gradations = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    else:
+        min_cov = float(np.min(non_zero))
+        max_cov = float(np.max(non_zero))
+        range_cov = max_cov - min_cov
+
+        if range_cov < 20:
+            # Narrow range - use percentile-based gradations
+            percentiles = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            gradations = [float(np.percentile(non_zero, p)) for p in percentiles]
+            # Ensure unique values
+            gradations = sorted(list(set([round(g, 1) for g in gradations])))
+        else:
+            # Wide range - use standard 10% gradations
+            gradations = list(range(0, 101, 10))
+
+    # Calculate distribution for legend
+    distribution = {}
+    for i in range(len(gradations) - 1):
+        low, high = gradations[i], gradations[i + 1]
+        count = np.sum((coverage_pct >= low) & (coverage_pct < high))
+        distribution[f"{low:.0f}-{high:.0f}"] = int(count)
+
+    return {
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "duration_hours": duration_hours,
+        "step_minutes": step_minutes,
+        "total_steps": total_steps,
+        "latitudes": lats.tolist(),
+        "longitudes": lons.tolist(),
+        "coverage": coverage_pct.round(1).tolist(),
+        "gradations": gradations,
+        "distribution": distribution,
+        "stats": {
+            "min": float(np.min(coverage_pct)),
+            "max": float(np.max(coverage_pct)),
+            "mean": float(np.mean(coverage_pct)),
+            "median": float(np.median(coverage_pct)),
+            "non_zero_min": float(np.min(non_zero)) if len(non_zero) > 0 else 0,
+            "non_zero_count": int(np.sum(coverage_pct > 0))
+        },
+        "session_id": session_id
+    }
+
+
+# ============================================================================
+# PASS SCHEDULE
+# ============================================================================
+
+@app.get("/api/passes")
+async def get_pass_schedule(
+    latitude: float = Query(..., ge=-90, le=90),
+    longitude: float = Query(..., ge=-180, le=180),
+    altitude_km: float = 0.0,
+    duration_hours: float = 24.0,
+    min_elevation: float = 10.0,
+    session_id: Optional[str] = None
+):
+    """
+    Get pass schedule for all satellites over a ground location.
+
+    Returns a list of satellite passes sorted by start time, including:
+    - Satellite name
+    - AOS (Acquisition of Signal) time and azimuth
+    - LOS (Loss of Signal) time and azimuth
+    - TCA (Time of Closest Approach) with max elevation
+    - Pass duration
+    """
+    constellation = get_constellation(session_id)
+    ground = GroundPosition(latitude, longitude, altitude_km)
+
+    start_time = datetime.now(timezone.utc)
+    end_time = start_time + timedelta(hours=duration_hours)
+
+    config = PropagationConfig(min_elevation=min_elevation)
+
+    all_passes = []
+
+    for sat_name, sat in constellation.satellites:
+        try:
+            windows = find_visibility_windows(sat, ground, start_time, end_time, config)
+
+            for window in windows:
+                # Get AOS (start) geometry
+                aos_look = calculate_satellite_geometry(sat, ground, window.start)
+
+                # Get LOS (end) geometry
+                los_look = calculate_satellite_geometry(sat, ground, window.end)
+
+                # Find TCA (max elevation time) - simple approach: midpoint refined
+                # For more accuracy, we could do a binary search
+                duration_sec = (window.end - window.start).total_seconds()
+                tca_time = window.start + timedelta(seconds=duration_sec / 2)
+
+                # Refine TCA by checking a few points around midpoint
+                best_elev = window.max_elevation
+                best_time = tca_time
+                for offset in [-duration_sec/4, 0, duration_sec/4]:
+                    check_time = window.start + timedelta(seconds=duration_sec/2 + offset)
+                    if window.start <= check_time <= window.end:
+                        check_look = calculate_satellite_geometry(sat, ground, check_time)
+                        if check_look.elevation > best_elev:
+                            best_elev = check_look.elevation
+                            best_time = check_time
+
+                tca_look = calculate_satellite_geometry(sat, ground, best_time)
+
+                all_passes.append({
+                    "satellite": sat_name,
+                    "aos": {
+                        "time": window.start.isoformat(),
+                        "azimuth": round(aos_look.azimuth, 1),
+                        "azimuth_compass": azimuth_to_compass(aos_look.azimuth)
+                    },
+                    "tca": {
+                        "time": best_time.isoformat(),
+                        "elevation": round(best_elev, 1),
+                        "azimuth": round(tca_look.azimuth, 1)
+                    },
+                    "los": {
+                        "time": window.end.isoformat(),
+                        "azimuth": round(los_look.azimuth, 1),
+                        "azimuth_compass": azimuth_to_compass(los_look.azimuth)
+                    },
+                    "duration_seconds": round(duration_sec),
+                    "duration_formatted": format_duration(duration_sec),
+                    "max_elevation": round(window.max_elevation, 1)
+                })
+
+        except ValueError:
+            # Propagation error for this satellite
+            continue
+
+    # Sort by AOS time
+    all_passes.sort(key=lambda p: p["aos"]["time"])
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "altitude_km": altitude_km,
+        "start": start_time.isoformat(),
+        "end": end_time.isoformat(),
+        "duration_hours": duration_hours,
+        "min_elevation": min_elevation,
+        "total_passes": len(all_passes),
+        "passes": all_passes,
+        "session_id": session_id
+    }
+
+
+def azimuth_to_compass(azimuth: float) -> str:
+    """Convert azimuth angle to compass direction."""
+    directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    index = round(azimuth / 22.5) % 16
+    return directions[index]
+
+
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to MM:SS string."""
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{minutes}:{secs:02d}"
+
+
+# ============================================================================
+# NEW ENDPOINTS: TLE Loading and Session Management
+# ============================================================================
+
+@app.get("/api/celestrak/presets")
+async def get_celestrak_presets_endpoint():
+    """List available CelesTrak presets."""
+    presets = get_celestrak_presets()
+    return {
+        "presets": [
+            {"name": name, "url": url}
+            for name, url in sorted(presets.items())
+        ]
+    }
+
+
+@app.post("/api/constellation/load")
+async def load_constellation(request: LoadTLERequest):
+    """
+    Load a constellation from TLE text, CelesTrak preset, or URL.
+
+    Returns a session ID to use for subsequent requests.
+    """
+    try:
+        # Determine source and load TLEs
+        if request.tle_text:
+            tles = parse_tle_text(request.tle_text)
+            source = "text"
+        elif request.celestrak_preset:
+            tles = await fetch_celestrak_preset(request.celestrak_preset)
+            source = f"celestrak:{request.celestrak_preset}"
+        elif request.tle_url:
+            text = await fetch_tle_from_url(request.tle_url)
+            tles = parse_tle_text(text)
+            source = f"url:{request.tle_url}"
+        else:
+            raise HTTPException(status_code=400, detail="No TLE source provided")
+
+        if not tles:
+            raise HTTPException(status_code=400, detail="No valid TLEs found")
+
+        # Create constellation
+        constellation = Constellation(f"User Constellation ({source})")
+        constellation.add_from_tle_list(tles)
+
+        # Create session
+        session_id = str(uuid.uuid4())
+        SESSION_STORE[session_id] = {
+            'constellation': constellation,
+            'source': source,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+
+        return {
+            "session_id": session_id,
+            "source": source,
+            "satellite_count": constellation.size,
+            "satellites": [name for name, _ in constellation.satellites[:50]],
+            "truncated": constellation.size > 50
+        }
+
+    except TLEParseError as e:
+        raise HTTPException(status_code=400, detail=f"TLE parse error: {e}")
+    except TLEFetchError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch TLEs: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/constellation/upload")
+async def upload_constellation(file: UploadFile = File(...)):
+    """
+    Upload a TLE file and create a session.
+
+    Accepts .txt or .tle files.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+
+    # Check file extension
+    if not file.filename.lower().endswith(('.txt', '.tle')):
+        raise HTTPException(status_code=400, detail="File must be .txt or .tle")
+
+    try:
+        content = await file.read()
+        text = content.decode('utf-8')
+
+        tles = parse_tle_text(text)
+
+        if not tles:
+            raise HTTPException(status_code=400, detail="No valid TLEs found in file")
+
+        # Create constellation
+        constellation = Constellation(f"Uploaded: {file.filename}")
+        constellation.add_from_tle_list(tles)
+
+        # Create session
+        session_id = str(uuid.uuid4())
+        SESSION_STORE[session_id] = {
+            'constellation': constellation,
+            'source': f"upload:{file.filename}",
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+
+        return {
+            "session_id": session_id,
+            "source": f"upload:{file.filename}",
+            "satellite_count": constellation.size,
+            "satellites": [name for name, _ in constellation.satellites[:50]],
+            "truncated": constellation.size > 50
+        }
+
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded text")
+    except TLEParseError as e:
+        raise HTTPException(status_code=400, detail=f"TLE parse error: {e}")
+
+
+@app.get("/api/constellation/{session_id}")
+async def get_session_info(session_id: str):
+    """Get information about a session's constellation."""
+    if session_id not in SESSION_STORE:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = SESSION_STORE[session_id]
+    constellation = session['constellation']
+
+    return {
+        "session_id": session_id,
+        "source": session['source'],
+        "created_at": session['created_at'],
+        "satellite_count": constellation.size,
+        "satellites": [name for name, _ in constellation.satellites[:50]],
+        "truncated": constellation.size > 50
+    }
+
+
+@app.post("/api/coverage/calculate/{session_id}")
+async def calculate_session_coverage(session_id: str, request: CoverageRequest):
+    """Calculate coverage for a session's constellation at a specific point."""
+    if session_id not in SESSION_STORE:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    constellation = SESSION_STORE[session_id]['constellation']
+    ground = GroundPosition(request.latitude, request.longitude, request.altitude_km)
+    start_time = datetime.now(timezone.utc)
+
+    config = ConstellationConfig(
+        min_elevation=request.min_elevation,
+        time_step_seconds=60.0,
+    )
+
+    coverage_percent = calculate_constellation_coverage_at_point(
+        constellation,
+        ground,
+        start_time,
+        duration_days=request.duration_hours / 24.0,
+        config=config,
+    )
+
+    return {
+        "session_id": session_id,
+        "latitude": request.latitude,
+        "longitude": request.longitude,
+        "altitude_km": request.altitude_km,
+        "duration_hours": request.duration_hours,
+        "min_elevation": request.min_elevation,
+        "coverage_percent": round(coverage_percent, 2),
+        "satellite_count": constellation.size,
+        "start_time": start_time.isoformat()
+    }
+
+
+@app.delete("/api/constellation/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session."""
+    if session_id not in SESSION_STORE:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    del SESSION_STORE[session_id]
+    return {"message": "Session deleted", "session_id": session_id}
 
 
 def get_html_page():
@@ -256,7 +727,7 @@ def get_html_page():
             height: 100vh;
         }
         .sidebar {
-            width: 320px;
+            width: 360px;
             background: #16213e;
             padding: 20px;
             overflow-y: auto;
@@ -289,13 +760,19 @@ def get_html_page():
             margin-bottom: 5px;
             font-size: 0.9rem;
         }
-        input[type="range"], input[type="number"] {
+        input[type="range"], input[type="number"], input[type="text"], select, textarea {
             width: 100%;
             background: #0f3460;
-            border: none;
+            border: 1px solid #1a1a2e;
             padding: 8px;
             border-radius: 4px;
             color: #fff;
+            font-size: 0.9rem;
+        }
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+            font-family: monospace;
         }
         input[type="range"] {
             padding: 0;
@@ -309,6 +786,9 @@ def get_html_page():
             height: 16px;
             background: #00d9ff;
             border-radius: 50%;
+            cursor: pointer;
+        }
+        select {
             cursor: pointer;
         }
         button {
@@ -329,6 +809,14 @@ def get_html_page():
             background: #555;
             cursor: not-allowed;
         }
+        button.secondary {
+            background: #0f3460;
+            color: #00d9ff;
+            border: 1px solid #00d9ff;
+        }
+        button.secondary:hover {
+            background: #1a4a70;
+        }
         .stats {
             background: #0f3460;
             padding: 15px;
@@ -345,16 +833,16 @@ def get_html_page():
             font-weight: bold;
         }
         .satellite-list {
-            max-height: 200px;
+            max-height: 150px;
             overflow-y: auto;
             background: #0f3460;
             border-radius: 8px;
             padding: 10px;
         }
         .satellite-item {
-            padding: 8px;
+            padding: 6px;
             border-bottom: 1px solid #1a1a2e;
-            font-size: 0.9rem;
+            font-size: 0.85rem;
         }
         .satellite-item:last-child {
             border-bottom: none;
@@ -396,14 +884,218 @@ def get_html_page():
             background: #0f3460;
             padding: 15px;
             border-radius: 8px;
-            margin-top: 20px;
+            margin-top: 15px;
+        }
+        .tabs {
+            display: flex;
+            gap: 5px;
+            margin-bottom: 10px;
+        }
+        .tab {
+            flex: 1;
+            padding: 8px;
+            background: #0f3460;
+            border: none;
+            border-radius: 4px 4px 0 0;
+            color: #888;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .tab.active {
+            background: #1a4a70;
+            color: #00d9ff;
+        }
+        .tab-content {
+            display: none;
+            background: #0f3460;
+            padding: 15px;
+            border-radius: 0 0 8px 8px;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .session-info {
+            background: #0a2a4e;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 10px;
+            font-size: 0.85rem;
+        }
+        .session-info.active {
+            border-left: 3px solid #00d9ff;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            margin-left: 5px;
+        }
+        .status-badge.default {
+            background: #444;
+        }
+        .status-badge.custom {
+            background: #00d9ff;
+            color: #1a1a2e;
+        }
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+            width: 100%;
+        }
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: 0;
+            top: 0;
+            opacity: 0;
+            cursor: pointer;
+            width: 100%;
+            height: 100%;
+        }
+        .file-input-btn {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            background: #0f3460;
+            border: 2px dashed #00d9ff;
+            border-radius: 4px;
+            color: #00d9ff;
+            text-align: center;
+            cursor: pointer;
+        }
+        .file-input-btn:hover {
+            background: #1a4a70;
+        }
+        .error-message {
+            color: #ff6b6b;
+            font-size: 0.85rem;
+            margin-top: 10px;
+        }
+        .success-message {
+            color: #51cf66;
+            font-size: 0.85rem;
+            margin-top: 10px;
+        }
+        .pass-list {
+            max-height: 400px;
+            overflow-y: auto;
+            background: #0f3460;
+            border-radius: 8px;
+            padding: 10px;
+        }
+        .pass-item {
+            background: #0a2a4e;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            border-left: 3px solid #00d9ff;
+        }
+        .pass-item:last-child {
+            margin-bottom: 0;
+        }
+        .pass-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .pass-satellite {
+            font-weight: bold;
+            color: #00d9ff;
+            font-size: 0.95rem;
+        }
+        .pass-elevation {
+            background: #00d9ff;
+            color: #1a1a2e;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        .pass-elevation.high {
+            background: #51cf66;
+        }
+        .pass-elevation.medium {
+            background: #fcc419;
+        }
+        .pass-elevation.low {
+            background: #ff6b6b;
+        }
+        .pass-details {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            font-size: 0.8rem;
+        }
+        .pass-detail {
+            text-align: center;
+        }
+        .pass-detail-label {
+            color: #888;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+        }
+        .pass-detail-value {
+            color: #fff;
+            font-weight: bold;
+        }
+        .pass-detail-sub {
+            color: #666;
+            font-size: 0.7rem;
+        }
+        .pass-summary {
+            background: #0a2a4e;
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            text-align: center;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="sidebar">
-            <h1>🛰️ Satellite Coverage</h1>
+            <h1>Satellite Coverage</h1>
+
+            <h2>TLE Source</h2>
+            <div class="tabs">
+                <button class="tab active" data-tab="paste">Paste</button>
+                <button class="tab" data-tab="upload">Upload</button>
+                <button class="tab" data-tab="celestrak">CelesTrak</button>
+            </div>
+
+            <div class="tab-content active" id="tab-paste">
+                <textarea id="tle-text" placeholder="Paste TLE data here...
+ISS (ZARYA)
+1 25544U 98067A...
+2 25544 51.6443..."></textarea>
+                <button id="load-tle-btn">Load TLEs</button>
+            </div>
+
+            <div class="tab-content" id="tab-upload">
+                <div class="file-input-wrapper">
+                    <div class="file-input-btn" id="file-label">Choose .txt or .tle file</div>
+                    <input type="file" id="tle-file" accept=".txt,.tle">
+                </div>
+                <button id="upload-tle-btn" disabled>Upload TLEs</button>
+            </div>
+
+            <div class="tab-content" id="tab-celestrak">
+                <label>Select Constellation:</label>
+                <select id="celestrak-select">
+                    <option value="">-- Select --</option>
+                </select>
+                <button id="fetch-celestrak-btn">Fetch from CelesTrak</button>
+            </div>
+
+            <div id="tle-status"></div>
+
+            <div class="session-info" id="session-info">
+                <strong>Source:</strong> <span id="session-source">Default</span>
+                <span class="status-badge default" id="session-badge">Default</span><br>
+                <strong>Satellites:</strong> <span id="session-count">-</span>
+            </div>
 
             <h2>Time Controls</h2>
             <div class="control-group">
@@ -412,21 +1104,49 @@ def get_html_page():
             </div>
 
             <div class="control-group">
-                <button id="play-btn">▶ Play Animation</button>
+                <button id="play-btn">Play Animation</button>
             </div>
 
-            <h2>Display Options</h2>
+            <h2>Coverage Map Settings</h2>
             <div class="control-group">
-                <label>Min Elevation: <span id="elev-value">10</span>°</label>
+                <label>Min Elevation: <span id="elev-value">10</span>&deg;</label>
                 <input type="range" id="min-elevation" min="0" max="45" value="10">
             </div>
 
             <div class="control-group">
-                <label>Grid Resolution: <span id="res-value">5</span>°</label>
-                <input type="range" id="resolution" min="2" max="15" value="5">
+                <label>Coverage Duration: <span id="duration-value">24</span>h</label>
+                <input type="range" id="coverage-duration" min="1" max="72" value="24">
             </div>
 
-            <button id="refresh-btn">🔄 Refresh Coverage</button>
+            <div class="control-group">
+                <label>Time Step: <span id="step-value">5</span> min</label>
+                <input type="range" id="time-step" min="1" max="30" value="5">
+            </div>
+
+            <button id="refresh-btn">Calculate Coverage Map</button>
+            <p style="font-size:0.75rem;color:#666;margin-top:5px;">1&deg; resolution, may take a moment</p>
+
+            <h2>Point Analysis</h2>
+            <div class="click-info" id="coverage-calc">
+                <label>Latitude:</label>
+                <input type="number" id="calc-lat" step="0.01" placeholder="Click map or enter">
+                <label style="margin-top:8px;">Longitude:</label>
+                <input type="number" id="calc-lon" step="0.01" placeholder="Click map or enter">
+                <label style="margin-top:8px;">Duration (hours):</label>
+                <input type="number" id="calc-duration" value="24" min="1" max="168">
+                <div style="display:flex;gap:10px;margin-top:10px;">
+                    <button id="calc-coverage-btn" style="flex:1;">Coverage</button>
+                    <button id="calc-passes-btn" style="flex:1;">Passes</button>
+                </div>
+                <div id="coverage-result"></div>
+            </div>
+
+            <div id="pass-schedule" style="display:none;">
+                <h2>Pass Schedule</h2>
+                <div class="pass-list" id="pass-list">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
 
             <h2>Satellites</h2>
             <div class="satellite-list" id="satellite-list">
@@ -440,31 +1160,32 @@ def get_html_page():
                     <span class="stat-value" id="stat-sats">-</span>
                 </div>
                 <div class="stat-row">
-                    <span>Visible Points:</span>
-                    <span class="stat-value" id="stat-visible">-</span>
+                    <span>Grid Cells:</span>
+                    <span class="stat-value" id="stat-cells">-</span>
                 </div>
                 <div class="stat-row">
-                    <span>Coverage:</span>
-                    <span class="stat-value" id="stat-coverage">-</span>
+                    <span>Avg Coverage:</span>
+                    <span class="stat-value" id="stat-avg">-</span>
+                </div>
+                <div class="stat-row">
+                    <span>Min/Max:</span>
+                    <span class="stat-value" id="stat-minmax">-</span>
                 </div>
             </div>
 
-            <h2>Click Map for Details</h2>
-            <div class="click-info" id="click-info">
-                Click anywhere on the map to see coverage details for that location.
-            </div>
+            <button id="reset-btn" class="secondary" style="margin-top:20px;">Reset to Default</button>
         </div>
 
         <div class="map-container">
             <div id="map"></div>
-            <div class="legend">
-                <div class="legend-item">
-                    <div class="legend-color" style="background: rgba(0, 217, 255, 0.6);"></div>
-                    <span>Coverage Area</span>
+            <div class="legend" id="legend">
+                <div style="font-weight:bold;margin-bottom:10px;">Coverage %</div>
+                <div id="legend-gradient" style="display:flex;flex-direction:column;gap:2px;">
+                    <!-- Populated by JS -->
                 </div>
-                <div class="legend-item">
+                <div class="legend-item" style="margin-top:10px;border-top:1px solid #444;padding-top:8px;">
                     <div class="legend-color" style="background: #ff4444;"></div>
-                    <span>Satellite Position</span>
+                    <span>Satellite</span>
                 </div>
             </div>
             <div class="loading" id="loading" style="display: none;">
@@ -474,77 +1195,538 @@ def get_html_page():
     </div>
 
     <script>
-        // Initialize map
-        const map = L.map('map').setView([20, 0], 2);
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-            attribution: '© OpenStreetMap contributors © CARTO',
-            maxZoom: 19
-        }).addTo(map);
-
-        // Layers
+        // State
+        let currentSessionId = null;
+        let map;
         let coverageLayer = null;
         let satelliteMarkers = [];
         let animationInterval = null;
         let isPlaying = false;
+        let selectedMarker = null;
+        let currentGradations = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+
+        // Color scale for coverage percentages (from red/orange to green/cyan)
+        const COVERAGE_COLORS = [
+            { pct: 0,   color: { r: 40,  g: 40,  b: 40  } },  // Dark gray (no coverage)
+            { pct: 10,  color: { r: 139, g: 0,   b: 0   } },  // Dark red
+            { pct: 20,  color: { r: 178, g: 34,  b: 34  } },  // Firebrick
+            { pct: 30,  color: { r: 255, g: 69,  b: 0   } },  // Orange red
+            { pct: 40,  color: { r: 255, g: 140, b: 0   } },  // Dark orange
+            { pct: 50,  color: { r: 255, g: 215, b: 0   } },  // Gold
+            { pct: 60,  color: { r: 154, g: 205, b: 50  } },  // Yellow green
+            { pct: 70,  color: { r: 50,  g: 205, b: 50  } },  // Lime green
+            { pct: 80,  color: { r: 0,   g: 206, b: 209 } },  // Dark turquoise
+            { pct: 90,  color: { r: 0,   g: 191, b: 255 } },  // Deep sky blue
+            { pct: 100, color: { r: 0,   g: 217, b: 255 } },  // Cyan
+        ];
+
+        function getColorForPercent(pct, gradations) {
+            // Find which gradation bucket this percentage falls into
+            let bucket = 0;
+            for (let i = 0; i < gradations.length - 1; i++) {
+                if (pct >= gradations[i] && pct < gradations[i + 1]) {
+                    bucket = i;
+                    break;
+                }
+                if (pct >= gradations[gradations.length - 1]) {
+                    bucket = gradations.length - 2;
+                }
+            }
+
+            // Map bucket to color scale
+            const colorIdx = Math.floor((bucket / (gradations.length - 1)) * (COVERAGE_COLORS.length - 1));
+            const c = COVERAGE_COLORS[Math.min(colorIdx, COVERAGE_COLORS.length - 1)].color;
+            return `rgba(${c.r}, ${c.g}, ${c.b}, 0.7)`;
+        }
+
+        function updateLegend(gradations, stats) {
+            const legend = document.getElementById('legend-gradient');
+            legend.innerHTML = '';
+
+            // Create legend items from high to low
+            for (let i = gradations.length - 2; i >= 0; i--) {
+                const low = gradations[i];
+                const high = gradations[i + 1];
+                const midPct = (low + high) / 2;
+                const color = getColorForPercent(midPct, gradations);
+
+                const item = document.createElement('div');
+                item.className = 'legend-item';
+                item.innerHTML = `
+                    <div class="legend-color" style="background: ${color};"></div>
+                    <span>${low.toFixed(0)}-${high.toFixed(0)}%</span>
+                `;
+                legend.appendChild(item);
+            }
+        }
+
+        // Initialize map
+        function initMap() {
+            map = L.map('map').setView([20, 0], 2);
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+                maxZoom: 19
+            }).addTo(map);
+
+            // Map click handler for coverage calculator
+            map.on('click', (e) => {
+                const { lat, lng } = e.latlng;
+                document.getElementById('calc-lat').value = lat.toFixed(4);
+                document.getElementById('calc-lon').value = lng.toFixed(4);
+
+                // Add/move marker
+                if (selectedMarker) {
+                    selectedMarker.setLatLng(e.latlng);
+                } else {
+                    selectedMarker = L.marker(e.latlng, {
+                        icon: L.divIcon({
+                            className: 'selected-point',
+                            html: '<div style="background:#00d9ff;width:12px;height:12px;border-radius:50%;border:2px solid white;"></div>',
+                            iconSize: [16, 16],
+                            iconAnchor: [8, 8]
+                        })
+                    }).addTo(map);
+                }
+            });
+
+            // Initialize legend with default gradations
+            updateLegend(currentGradations, null);
+        }
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+            });
+        });
+
+        // Load CelesTrak presets
+        async function loadCelestrakPresets() {
+            try {
+                const response = await fetch('/api/celestrak/presets');
+                const data = await response.json();
+                const select = document.getElementById('celestrak-select');
+                data.presets.forEach(preset => {
+                    const option = document.createElement('option');
+                    option.value = preset.name;
+                    option.textContent = preset.name.charAt(0).toUpperCase() + preset.name.slice(1);
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Failed to load presets:', error);
+            }
+        }
+
+        // Update session info display
+        function updateSessionInfo(source, count, isCustom = false) {
+            document.getElementById('session-source').textContent = source;
+            document.getElementById('session-count').textContent = count;
+            const badge = document.getElementById('session-badge');
+            badge.textContent = isCustom ? 'Custom' : 'Default';
+            badge.className = 'status-badge ' + (isCustom ? 'custom' : 'default');
+        }
+
+        // Show status message
+        function showStatus(message, isError = false) {
+            const status = document.getElementById('tle-status');
+            status.innerHTML = `<div class="${isError ? 'error-message' : 'success-message'}">${message}</div>`;
+            setTimeout(() => { status.innerHTML = ''; }, 5000);
+        }
+
+        // Load TLEs from text
+        document.getElementById('load-tle-btn').addEventListener('click', async () => {
+            const text = document.getElementById('tle-text').value.trim();
+            if (!text) {
+                showStatus('Please paste TLE data first', true);
+                return;
+            }
+
+            const btn = document.getElementById('load-tle-btn');
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+
+            try {
+                const response = await fetch('/api/constellation/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tle_text: text })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to load TLEs');
+                }
+
+                const data = await response.json();
+                currentSessionId = data.session_id;
+                updateSessionInfo(data.source, data.satellite_count, true);
+                showStatus(`Loaded ${data.satellite_count} satellites`);
+
+                // Refresh display
+                loadSatellites();
+                updatePositions();
+                updateCoverage();
+
+            } catch (error) {
+                showStatus(error.message, true);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Load TLEs';
+            }
+        });
+
+        // File upload
+        document.getElementById('tle-file').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                document.getElementById('file-label').textContent = file.name;
+                document.getElementById('upload-tle-btn').disabled = false;
+            }
+        });
+
+        document.getElementById('upload-tle-btn').addEventListener('click', async () => {
+            const fileInput = document.getElementById('tle-file');
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            const btn = document.getElementById('upload-tle-btn');
+            btn.disabled = true;
+            btn.textContent = 'Uploading...';
+
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const response = await fetch('/api/constellation/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to upload TLEs');
+                }
+
+                const data = await response.json();
+                currentSessionId = data.session_id;
+                updateSessionInfo(data.source, data.satellite_count, true);
+                showStatus(`Uploaded ${data.satellite_count} satellites`);
+
+                // Refresh display
+                loadSatellites();
+                updatePositions();
+                updateCoverage();
+
+            } catch (error) {
+                showStatus(error.message, true);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Upload TLEs';
+            }
+        });
+
+        // CelesTrak fetch
+        document.getElementById('fetch-celestrak-btn').addEventListener('click', async () => {
+            const preset = document.getElementById('celestrak-select').value;
+            if (!preset) {
+                showStatus('Please select a constellation', true);
+                return;
+            }
+
+            const btn = document.getElementById('fetch-celestrak-btn');
+            btn.disabled = true;
+            btn.textContent = 'Fetching...';
+
+            try {
+                const response = await fetch('/api/constellation/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ celestrak_preset: preset })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to fetch TLEs');
+                }
+
+                const data = await response.json();
+                currentSessionId = data.session_id;
+                updateSessionInfo(data.source, data.satellite_count, true);
+                showStatus(`Fetched ${data.satellite_count} satellites from CelesTrak`);
+
+                // Refresh display
+                loadSatellites();
+                updatePositions();
+                updateCoverage();
+
+            } catch (error) {
+                showStatus(error.message, true);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Fetch from CelesTrak';
+            }
+        });
+
+        // Reset to default
+        document.getElementById('reset-btn').addEventListener('click', () => {
+            currentSessionId = null;
+            updateSessionInfo('Default', '-', false);
+            loadSatellites();
+            updatePositions();
+            updateCoverage();
+            showStatus('Reset to default constellation');
+        });
+
+        // Calculate coverage for selected point
+        document.getElementById('calc-coverage-btn').addEventListener('click', async () => {
+            const lat = parseFloat(document.getElementById('calc-lat').value);
+            const lon = parseFloat(document.getElementById('calc-lon').value);
+            const duration = parseFloat(document.getElementById('calc-duration').value);
+
+            if (isNaN(lat) || isNaN(lon)) {
+                document.getElementById('coverage-result').innerHTML =
+                    '<div class="error-message">Please enter valid coordinates or click on the map</div>';
+                return;
+            }
+
+            const btn = document.getElementById('calc-coverage-btn');
+            btn.disabled = true;
+            btn.textContent = 'Calculating...';
+            document.getElementById('coverage-result').innerHTML = 'Calculating coverage...';
+
+            try {
+                let response;
+                if (currentSessionId) {
+                    response = await fetch(`/api/coverage/calculate/${currentSessionId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            latitude: lat,
+                            longitude: lon,
+                            duration_hours: duration,
+                            min_elevation: parseFloat(document.getElementById('min-elevation').value)
+                        })
+                    });
+                } else {
+                    response = await fetch(
+                        `/api/coverage/point?latitude=${lat}&longitude=${lon}&duration_hours=${duration}&min_elevation=${document.getElementById('min-elevation').value}`
+                    );
+                }
+
+                if (!response.ok) throw new Error('Calculation failed');
+
+                const data = await response.json();
+                document.getElementById('coverage-result').innerHTML = `
+                    <div style="margin-top:10px;padding:10px;background:#0a2a4e;border-radius:4px;">
+                        <strong>Coverage: ${data.coverage_percent}%</strong><br>
+                        <small>Duration: ${duration}h | Satellites: ${data.satellite_count || data.timeline?.length || '-'}</small>
+                    </div>
+                `;
+            } catch (error) {
+                document.getElementById('coverage-result').innerHTML =
+                    '<div class="error-message">Failed to calculate coverage</div>';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Coverage';
+            }
+        });
+
+        // Get pass schedule for selected point
+        document.getElementById('calc-passes-btn').addEventListener('click', async () => {
+            const lat = parseFloat(document.getElementById('calc-lat').value);
+            const lon = parseFloat(document.getElementById('calc-lon').value);
+            const duration = parseFloat(document.getElementById('calc-duration').value);
+            const minElev = parseFloat(document.getElementById('min-elevation').value);
+
+            if (isNaN(lat) || isNaN(lon)) {
+                document.getElementById('coverage-result').innerHTML =
+                    '<div class="error-message">Please enter valid coordinates or click on the map</div>';
+                return;
+            }
+
+            const btn = document.getElementById('calc-passes-btn');
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+
+            try {
+                let url = `/api/passes?latitude=${lat}&longitude=${lon}&duration_hours=${duration}&min_elevation=${minElev}`;
+                if (currentSessionId) {
+                    url += `&session_id=${currentSessionId}`;
+                }
+
+                const response = await fetch(url);
+                if (!response.ok) throw new Error('Failed to get passes');
+
+                const data = await response.json();
+                displayPasses(data);
+
+            } catch (error) {
+                document.getElementById('coverage-result').innerHTML =
+                    '<div class="error-message">Failed to get pass schedule</div>';
+                document.getElementById('pass-schedule').style.display = 'none';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Passes';
+            }
+        });
+
+        // Display pass schedule
+        function displayPasses(data) {
+            const container = document.getElementById('pass-schedule');
+            const list = document.getElementById('pass-list');
+
+            if (data.passes.length === 0) {
+                document.getElementById('coverage-result').innerHTML =
+                    '<div style="margin-top:10px;padding:10px;background:#0a2a4e;border-radius:4px;">No passes found in the next ' + data.duration_hours + ' hours</div>';
+                container.style.display = 'none';
+                return;
+            }
+
+            // Show summary in coverage result area
+            document.getElementById('coverage-result').innerHTML = `
+                <div style="margin-top:10px;padding:10px;background:#0a2a4e;border-radius:4px;">
+                    <strong>${data.total_passes} passes</strong> in next ${data.duration_hours}h<br>
+                    <small>Min elevation: ${data.min_elevation}&deg;</small>
+                </div>
+            `;
+
+            // Build pass list HTML
+            let html = '';
+
+            data.passes.forEach((pass, idx) => {
+                const aosTime = new Date(pass.aos.time);
+                const losTime = new Date(pass.los.time);
+                const tcaTime = new Date(pass.tca.time);
+
+                // Determine elevation class
+                let elevClass = 'low';
+                if (pass.max_elevation >= 60) elevClass = 'high';
+                else if (pass.max_elevation >= 30) elevClass = 'medium';
+
+                html += `
+                    <div class="pass-item">
+                        <div class="pass-header">
+                            <span class="pass-satellite">${pass.satellite}</span>
+                            <span class="pass-elevation ${elevClass}">${pass.max_elevation}&deg; max</span>
+                        </div>
+                        <div class="pass-details">
+                            <div class="pass-detail">
+                                <div class="pass-detail-label">AOS</div>
+                                <div class="pass-detail-value">${aosTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
+                                <div class="pass-detail-sub">${pass.aos.azimuth_compass} (${pass.aos.azimuth}&deg;)</div>
+                            </div>
+                            <div class="pass-detail">
+                                <div class="pass-detail-label">TCA</div>
+                                <div class="pass-detail-value">${tcaTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
+                                <div class="pass-detail-sub">${pass.tca.elevation}&deg; el</div>
+                            </div>
+                            <div class="pass-detail">
+                                <div class="pass-detail-label">LOS</div>
+                                <div class="pass-detail-value">${losTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
+                                <div class="pass-detail-sub">${pass.los.azimuth_compass} (${pass.los.azimuth}&deg;)</div>
+                            </div>
+                        </div>
+                        <div style="text-align:center;margin-top:8px;font-size:0.75rem;color:#666;">
+                            Duration: ${pass.duration_formatted} | ${aosTime.toLocaleDateString()}
+                        </div>
+                    </div>
+                `;
+            });
+
+            list.innerHTML = html;
+            container.style.display = 'block';
+        }
 
         // Load satellites
         async function loadSatellites() {
-            const response = await fetch('/api/satellites');
-            const data = await response.json();
+            const url = currentSessionId
+                ? `/api/satellites?session_id=${currentSessionId}`
+                : '/api/satellites';
 
-            const list = document.getElementById('satellite-list');
-            list.innerHTML = data.satellites.map(name =>
-                `<div class="satellite-item"><span class="satellite-name">🛰️</span> ${name}</div>`
-            ).join('');
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
 
-            document.getElementById('stat-sats').textContent = data.count;
+                const list = document.getElementById('satellite-list');
+                list.innerHTML = data.satellites.slice(0, 50).map(name =>
+                    `<div class="satellite-item"><span class="satellite-name">&#128752;</span> ${name}</div>`
+                ).join('');
+
+                if (data.count > 50) {
+                    list.innerHTML += `<div class="satellite-item" style="color:#888;">... and ${data.count - 50} more</div>`;
+                }
+
+                document.getElementById('stat-sats').textContent = data.count;
+
+                if (!currentSessionId) {
+                    updateSessionInfo('Default', data.count, false);
+                }
+            } catch (error) {
+                console.error('Failed to load satellites:', error);
+            }
         }
 
         // Update satellite positions
         async function updatePositions() {
             const offset = document.getElementById('time-offset').value;
-            const response = await fetch(`/api/positions?offset_minutes=${offset}`);
-            const data = await response.json();
+            const url = currentSessionId
+                ? `/api/positions?offset_minutes=${offset}&session_id=${currentSessionId}`
+                : `/api/positions?offset_minutes=${offset}`;
 
-            // Clear existing markers
-            satelliteMarkers.forEach(m => map.removeLayer(m));
-            satelliteMarkers = [];
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
 
-            // Add new markers
-            data.positions.forEach(sat => {
-                const marker = L.circleMarker([sat.latitude, sat.longitude], {
-                    radius: 8,
-                    fillColor: '#ff4444',
-                    color: '#fff',
-                    weight: 2,
-                    fillOpacity: 0.8
-                }).addTo(map);
+                // Clear existing markers
+                satelliteMarkers.forEach(m => map.removeLayer(m));
+                satelliteMarkers = [];
 
-                marker.bindPopup(`
-                    <b>${sat.name}</b><br>
-                    Lat: ${sat.latitude.toFixed(2)}°<br>
-                    Lon: ${sat.longitude.toFixed(2)}°<br>
-                    Alt: ${sat.altitude_km.toFixed(0)} km<br>
-                    Vel: ${sat.velocity_km_s.toFixed(2)} km/s
-                `);
+                // Add new markers
+                data.positions.forEach(sat => {
+                    const marker = L.circleMarker([sat.latitude, sat.longitude], {
+                        radius: 8,
+                        fillColor: '#ff4444',
+                        color: '#fff',
+                        weight: 2,
+                        fillOpacity: 0.8
+                    }).addTo(map);
 
-                satelliteMarkers.push(marker);
-            });
+                    marker.bindPopup(`
+                        <b>${sat.name}</b><br>
+                        Lat: ${sat.latitude.toFixed(2)}&deg;<br>
+                        Lon: ${sat.longitude.toFixed(2)}&deg;<br>
+                        Alt: ${sat.altitude_km.toFixed(0)} km<br>
+                        Vel: ${sat.velocity_km_s.toFixed(2)} km/s
+                    `);
+
+                    satelliteMarkers.push(marker);
+                });
+            } catch (error) {
+                console.error('Failed to update positions:', error);
+            }
         }
 
-        // Update coverage map
+        // Update coverage map with percentage gradations
         async function updateCoverage() {
             const loading = document.getElementById('loading');
             loading.style.display = 'block';
+            loading.textContent = 'Calculating coverage map (this may take a moment)...';
 
             const offset = document.getElementById('time-offset').value;
-            const resolution = document.getElementById('resolution').value;
+            const duration = document.getElementById('coverage-duration').value;
+            const stepMin = document.getElementById('time-step').value;
             const minElev = document.getElementById('min-elevation').value;
 
+            let url = `/api/coverage/map?offset_minutes=${offset}&duration_hours=${duration}&step_minutes=${stepMin}&min_elevation=${minElev}`;
+            if (currentSessionId) {
+                url += `&session_id=${currentSessionId}`;
+            }
+
             try {
-                const response = await fetch(
-                    `/api/coverage/instant?offset_minutes=${offset}&resolution=${resolution}&min_elevation=${minElev}`
-                );
+                const response = await fetch(url);
                 const data = await response.json();
 
                 // Remove old coverage layer
@@ -552,17 +1734,20 @@ def get_html_page():
                     map.removeLayer(coverageLayer);
                 }
 
-                // Create coverage polygons
+                // Update gradations from server response
+                currentGradations = data.gradations;
+                updateLegend(currentGradations, data.stats);
+
+                // Create coverage polygons with gradient colors
                 const polygons = [];
-                let visibleCount = 0;
-                const res = parseFloat(resolution);
+                const res = 1.0; // 1 degree resolution
 
                 data.coverage.forEach((row, i) => {
-                    row.forEach((val, j) => {
-                        if (val === 1) {
-                            visibleCount++;
+                    row.forEach((pct, j) => {
+                        if (pct > 0) {
                             const lat = data.latitudes[i];
                             const lon = data.longitudes[j];
+                            const color = getColorForPercent(pct, currentGradations);
 
                             const bounds = [
                                 [lat, lon],
@@ -571,12 +1756,21 @@ def get_html_page():
                                 [lat + res, lon]
                             ];
 
-                            polygons.push(L.polygon(bounds, {
-                                color: 'rgba(0, 217, 255, 0.3)',
-                                fillColor: 'rgba(0, 217, 255, 0.4)',
-                                fillOpacity: 0.4,
+                            const poly = L.polygon(bounds, {
+                                color: 'transparent',
+                                fillColor: color,
+                                fillOpacity: 0.7,
                                 weight: 0
-                            }));
+                            });
+
+                            // Add popup with coverage info
+                            poly.bindPopup(`
+                                <b>Coverage: ${pct.toFixed(1)}%</b><br>
+                                Lat: ${lat.toFixed(0)}&deg; to ${(lat+1).toFixed(0)}&deg;<br>
+                                Lon: ${lon.toFixed(0)}&deg; to ${(lon+1).toFixed(0)}&deg;
+                            `);
+
+                            polygons.push(poly);
                         }
                     });
                 });
@@ -585,41 +1779,19 @@ def get_html_page():
 
                 // Update stats
                 const totalCells = data.coverage.length * data.coverage[0].length;
-                const coveragePercent = (visibleCount / totalCells * 100).toFixed(1);
+                const nonZeroCells = data.stats.non_zero_count;
 
-                document.getElementById('stat-visible').textContent = visibleCount;
-                document.getElementById('stat-coverage').textContent = coveragePercent + '%';
+                document.getElementById('stat-cells').textContent = `${nonZeroCells.toLocaleString()} / ${totalCells.toLocaleString()}`;
+                document.getElementById('stat-avg').textContent = data.stats.mean.toFixed(1) + '%';
+                document.getElementById('stat-minmax').textContent = `${data.stats.min.toFixed(0)}% / ${data.stats.max.toFixed(0)}%`;
 
             } catch (error) {
                 console.error('Error loading coverage:', error);
+                loading.textContent = 'Error loading coverage data';
             }
 
             loading.style.display = 'none';
         }
-
-        // Handle map clicks
-        map.on('click', async (e) => {
-            const { lat, lng } = e.latlng;
-            const info = document.getElementById('click-info');
-            info.innerHTML = `Loading data for (${lat.toFixed(2)}°, ${lng.toFixed(2)}°)...`;
-
-            try {
-                const response = await fetch(
-                    `/api/coverage/point?latitude=${lat}&longitude=${lng}&duration_hours=24`
-                );
-                const data = await response.json();
-
-                const visibleSats = data.timeline.filter(t => t.visible).length;
-
-                info.innerHTML = `
-                    <b>Location:</b> ${lat.toFixed(2)}°, ${lng.toFixed(2)}°<br>
-                    <b>24h Coverage:</b> ${data.coverage_percent}%<br>
-                    <b>Visible samples:</b> ${visibleSats}/${data.timeline.length}
-                `;
-            } catch (error) {
-                info.innerHTML = 'Error loading data';
-            }
-        });
 
         // Event listeners
         document.getElementById('time-offset').addEventListener('input', (e) => {
@@ -631,8 +1803,12 @@ def get_html_page():
             document.getElementById('elev-value').textContent = e.target.value;
         });
 
-        document.getElementById('resolution').addEventListener('input', (e) => {
-            document.getElementById('res-value').textContent = e.target.value;
+        document.getElementById('coverage-duration').addEventListener('input', (e) => {
+            document.getElementById('duration-value').textContent = e.target.value;
+        });
+
+        document.getElementById('time-step').addEventListener('input', (e) => {
+            document.getElementById('step-value').textContent = e.target.value;
         });
 
         document.getElementById('refresh-btn').addEventListener('click', () => {
@@ -646,10 +1822,10 @@ def get_html_page():
 
             if (isPlaying) {
                 clearInterval(animationInterval);
-                btn.textContent = '▶ Play Animation';
+                btn.textContent = 'Play Animation';
                 isPlaying = false;
             } else {
-                btn.textContent = '⏸ Pause';
+                btn.textContent = 'Pause';
                 isPlaying = true;
 
                 animationInterval = setInterval(() => {
@@ -662,7 +1838,9 @@ def get_html_page():
             }
         });
 
-        // Initial load
+        // Initialize
+        initMap();
+        loadCelestrakPresets();
         loadSatellites();
         updatePositions();
         updateCoverage();

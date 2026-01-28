@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from satellite import (
-    Satrec, parse_tle, GroundPosition, LookAngle,
-    propagate, datetime_to_gmst, teme_to_ecef, calculate_look_angle, is_visible
+    Satrec, parse_tle, GroundPosition, LookAngle, Position,
+    propagate, datetime_to_gmst, teme_to_ecef, calculate_look_angle, is_visible,
+    geodetic_to_ecef_grid, calculate_visibility_grid_multi_sat
 )
 from propagation import (
     PropagationConfig, adaptive_propagate, VisibilityWindow,
@@ -175,6 +176,7 @@ def calculate_constellation_coverage_map(
     Calculate coverage map for a constellation over a time period.
 
     Returns a ConstellationCoverage object with spatial coverage data.
+    Uses vectorized computation for significant performance improvement.
     """
     if config is None:
         config = ConstellationConfig()
@@ -183,7 +185,77 @@ def calculate_constellation_coverage_map(
     lats = np.arange(-90, 90, resolution_deg)
     lons = np.arange(-180, 180, resolution_deg)
 
-    coverage_map = np.zeros((len(lats), len(lons)), dtype=np.float32)
+    visible_counts = np.zeros((len(lats), len(lons)), dtype=np.int32)
+
+    end_time = start_time + timedelta(hours=duration_hours)
+    total_seconds = duration_hours * 3600
+    total_steps = int(total_seconds / config.time_step_seconds)
+
+    # Precompute ground ECEF positions once (vectorized)
+    ground_x, ground_y, ground_z = geodetic_to_ecef_grid(lats, lons, alt=0.0)
+
+    current_time = start_time
+    step = 0
+
+    while current_time < end_time:
+        gmst = datetime_to_gmst(current_time)
+
+        # Precompute all satellite positions at this time
+        sat_positions = []
+        for name, sat in constellation.satellites:
+            try:
+                pos, _ = propagate(sat, current_time)
+                sat_ecef = teme_to_ecef(pos, gmst)
+                sat_positions.append(sat_ecef)
+            except ValueError:
+                continue
+
+        # Vectorized visibility check for all grid points
+        visibility = calculate_visibility_grid_multi_sat(
+            sat_positions, ground_x, ground_y, ground_z,
+            lats, lons, config.min_elevation
+        )
+        visible_counts += visibility.astype(np.int32)
+
+        step += 1
+        if progress_callback and step % 10 == 0:
+            progress_callback(step, total_steps, current_time)
+
+        current_time += timedelta(seconds=config.time_step_seconds)
+
+    # Convert counts to percentages
+    coverage_map = (visible_counts / max(1, step)) * 100
+
+    return ConstellationCoverage(
+        coverage_map=coverage_map.astype(np.float32),
+        latitudes=lats,
+        longitudes=lons,
+        total_time_seconds=total_seconds,
+        num_satellites=constellation.size,
+        average_coverage=float(np.mean(coverage_map))
+    )
+
+
+def calculate_constellation_coverage_map_scalar(
+    constellation: Constellation,
+    start_time: datetime,
+    duration_hours: float,
+    resolution_deg: float = 5.0,
+    config: Optional[ConstellationConfig] = None,
+    progress_callback=None
+) -> ConstellationCoverage:
+    """
+    Calculate coverage map using scalar (non-vectorized) computation.
+
+    Provided for comparison and validation against vectorized version.
+    """
+    if config is None:
+        config = ConstellationConfig()
+
+    # Create lat/lon grid
+    lats = np.arange(-90, 90, resolution_deg)
+    lons = np.arange(-180, 180, resolution_deg)
+
     visible_counts = np.zeros((len(lats), len(lons)), dtype=np.int32)
 
     end_time = start_time + timedelta(hours=duration_hours)
@@ -206,7 +278,7 @@ def calculate_constellation_coverage_map(
             except ValueError:
                 continue
 
-        # Check visibility at each grid point
+        # Check visibility at each grid point (scalar loop)
         for i, lat in enumerate(lats):
             for j, lon in enumerate(lons):
                 ground = GroundPosition(lat, lon, 0.0)
@@ -228,12 +300,12 @@ def calculate_constellation_coverage_map(
     coverage_map = (visible_counts / max(1, step)) * 100
 
     return ConstellationCoverage(
-        coverage_map=coverage_map,
+        coverage_map=coverage_map.astype(np.float32),
         latitudes=lats,
         longitudes=lons,
         total_time_seconds=total_seconds,
         num_satellites=constellation.size,
-        average_coverage=np.mean(coverage_map)
+        average_coverage=float(np.mean(coverage_map))
     )
 
 
@@ -280,30 +352,54 @@ def demo_constellation_coverage():
         status = f"Yes ({count} sats, including {sat_name})" if visible else "No"
         print(f"  {city}: {status}")
 
-    # Short-duration coverage test
-    print(f"\n--- 2-Hour Coverage Map (5° resolution) ---")
+    import time as time_module
     config = ConstellationConfig(min_elevation=10.0, time_step_seconds=60.0)
 
-    import time as time_module
+    # Compare scalar vs vectorized coverage map calculation
+    print(f"\n--- 2-Hour Coverage Map Performance Comparison (5° resolution) ---")
+
+    # Scalar version
+    print("\nScalar computation:")
     t_start = time_module.time()
+    coverage_scalar = calculate_constellation_coverage_map_scalar(
+        constellation,
+        dt,
+        duration_hours=2.0,
+        resolution_deg=5.0,
+        config=config,
+        progress_callback=None
+    )
+    scalar_time = time_module.time() - t_start
+    print(f"  Time: {scalar_time:.2f}s")
+    print(f"  Average coverage: {coverage_scalar.average_coverage:.1f}%")
 
-    def progress(step, total, current_time):
-        if step % 30 == 0:
-            print(f"  Step {step}/{total} ({current_time.strftime('%H:%M')})")
-
+    # Vectorized version
+    print("\nVectorized computation:")
+    t_start = time_module.time()
     coverage = calculate_constellation_coverage_map(
         constellation,
         dt,
         duration_hours=2.0,
         resolution_deg=5.0,
         config=config,
-        progress_callback=progress
+        progress_callback=None
     )
-    elapsed = time_module.time() - t_start
+    vectorized_time = time_module.time() - t_start
+    print(f"  Time: {vectorized_time:.2f}s")
+    print(f"  Average coverage: {coverage.average_coverage:.1f}%")
 
-    print(f"\nResults:")
-    print(f"  Computation time: {elapsed:.2f}s")
-    print(f"  Average global coverage: {coverage.average_coverage:.1f}%")
+    # Verify results match
+    if np.allclose(coverage_scalar.coverage_map, coverage.coverage_map, rtol=1e-5):
+        print("\nPASS: Vectorized results match scalar results")
+    else:
+        diff = np.abs(coverage_scalar.coverage_map - coverage.coverage_map)
+        print(f"\nWARNING: Max difference: {np.max(diff):.6f}%")
+
+    # Speedup
+    speedup = scalar_time / vectorized_time if vectorized_time > 0 else float('inf')
+    print(f"\nVectorization speedup: {speedup:.1f}x")
+
+    print(f"\n--- Coverage Map Results ---")
     print(f"  Grid size: {coverage.latitudes.shape[0]} x {coverage.longitudes.shape[0]}")
 
     # Find best and worst coverage regions

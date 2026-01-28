@@ -15,7 +15,8 @@ import numpy as np
 
 from satellite import (
     Satrec, parse_tle, GroundPosition, LookAngle,
-    propagate, datetime_to_gmst, teme_to_ecef, calculate_look_angle, is_visible
+    propagate, datetime_to_gmst, teme_to_ecef, calculate_look_angle, is_visible,
+    calculate_visibility_grid, geodetic_to_ecef_grid, calculate_look_angles_grid
 )
 from propagation import PropagationConfig
 
@@ -214,6 +215,33 @@ def calculate_instant_coverage_map(
     Calculate a visibility map for a single instant using uniform grid.
 
     Returns a 2D numpy array where 1 = visible, 0 = not visible.
+    Uses vectorized computation for significant performance improvement.
+    """
+    # Create lat/lon grid
+    lats = np.arange(-90, 90, resolution_deg)
+    lons = np.arange(-180, 180, resolution_deg)
+
+    # Use vectorized visibility calculation
+    visibility, _, _, _ = calculate_visibility_grid(
+        satellite, dt, lats, lons, min_elevation
+    )
+
+    # Convert boolean to float32 for compatibility
+    visibility_map = visibility.astype(np.float32)
+
+    return visibility_map, lats, lons
+
+
+def calculate_instant_coverage_map_scalar(
+    satellite: Satrec,
+    dt: datetime,
+    resolution_deg: float = 2.0,
+    min_elevation: float = 10.0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate a visibility map using scalar (non-vectorized) computation.
+
+    Provided for comparison and validation against vectorized version.
     """
     # Create lat/lon grid
     lats = np.arange(-90, 90, resolution_deg)
@@ -254,24 +282,51 @@ def demo_adaptive_grid():
     print(f"\nSatellite: ISS (ZARYA)")
     print(f"Time: {dt}")
 
-    # Test 1: Uniform grid
-    print("\n--- Uniform Grid (2° resolution) ---")
     import time as time_module
 
+    # Test 1: Scalar (non-vectorized) uniform grid
+    print("\n--- Scalar Uniform Grid (2° resolution) ---")
+
     t_start = time_module.time()
-    vis_map, lats, lons = calculate_instant_coverage_map(
+    vis_map_scalar, lats, lons = calculate_instant_coverage_map_scalar(
         satellite, dt, resolution_deg=2.0, min_elevation=10.0
     )
-    uniform_time = time_module.time() - t_start
+    scalar_time = time_module.time() - t_start
 
     uniform_checks = len(lats) * len(lons)
-    visible_points = np.sum(vis_map)
+    visible_points_scalar = np.sum(vis_map_scalar)
 
     print(f"Grid size: {len(lats)} x {len(lons)} = {uniform_checks} points")
-    print(f"Visible points: {int(visible_points)}")
-    print(f"Time: {uniform_time:.3f}s")
+    print(f"Visible points: {int(visible_points_scalar)}")
+    print(f"Time: {scalar_time:.3f}s")
 
-    # Test 2: Adaptive grid
+    # Test 2: Vectorized uniform grid
+    print("\n--- Vectorized Uniform Grid (2° resolution) ---")
+
+    t_start = time_module.time()
+    vis_map_vec, lats, lons = calculate_instant_coverage_map(
+        satellite, dt, resolution_deg=2.0, min_elevation=10.0
+    )
+    vectorized_time = time_module.time() - t_start
+
+    visible_points_vec = np.sum(vis_map_vec)
+
+    print(f"Grid size: {len(lats)} x {len(lons)} = {uniform_checks} points")
+    print(f"Visible points: {int(visible_points_vec)}")
+    print(f"Time: {vectorized_time:.3f}s")
+
+    # Verify results match
+    if np.allclose(vis_map_scalar, vis_map_vec):
+        print("PASS: Vectorized results match scalar results")
+    else:
+        diff_count = np.sum(vis_map_scalar != vis_map_vec)
+        print(f"WARNING: {diff_count} points differ between scalar and vectorized")
+
+    # Speedup from vectorization
+    vec_speedup = scalar_time / vectorized_time if vectorized_time > 0 else float('inf')
+    print(f"\nVectorization speedup: {vec_speedup:.1f}x")
+
+    # Test 3: Adaptive grid
     print("\n--- Adaptive Grid (10° -> 2.5° refinement) ---")
 
     config = GridConfig(
@@ -293,12 +348,13 @@ def demo_adaptive_grid():
     print(f"Time: {adaptive_time:.3f}s")
 
     # Compare efficiency
-    print("\n--- Efficiency Comparison ---")
-    reduction = (1 - stats['visibility_checks'] / uniform_checks) * 100
-    speedup = uniform_time / adaptive_time if adaptive_time > 0 else float('inf')
+    print("\n--- Efficiency Summary ---")
+    print(f"Scalar uniform:     {scalar_time:.3f}s (baseline)")
+    print(f"Vectorized uniform: {vectorized_time:.3f}s ({vec_speedup:.1f}x faster)")
+    print(f"Adaptive grid:      {adaptive_time:.3f}s")
 
-    print(f"Visibility check reduction: {reduction:.1f}%")
-    print(f"Speedup: {speedup:.1f}x")
+    reduction = (1 - stats['visibility_checks'] / uniform_checks) * 100
+    print(f"\nAdaptive check reduction: {reduction:.1f}%")
 
     return cells, stats
 

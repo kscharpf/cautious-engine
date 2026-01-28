@@ -15,7 +15,7 @@ A Python toolkit for calculating and visualizing satellite constellation coverag
 
 ```bash
 # Clone or download the project
-cd ralph
+cd cautious-engine
 
 # Install dependencies
 pip install -r requirements.txt
